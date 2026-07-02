@@ -229,45 +229,78 @@ select_repos() {
 # ---------------------------------------------------------------------------
 # Resolve the xcf working directory
 # ---------------------------------------------------------------------------
-XCF_DIR=""
-resolve_xcf_dir() {
-  # A previous run may have persisted XCF_MONO_ROOT — offer to reuse it before
-  # falling back to the default-directory detection below.
-  if [[ -n "${XCF_MONO_ROOT:-}" ]]; then
-    local ans note=""
-    [[ -d "$XCF_MONO_ROOT" ]] || note=" (does not exist yet — will be created)"
-    info "XCF_MONO_ROOT is already set to: $XCF_MONO_ROOT$note"
-    read -r -p "Use this as the xcf workspace? [Y/n] " ans
-    if [[ -z "${ans:-}" || "${ans}" =~ ^[Yy]([Ee][Ss])?$ ]]; then
-      mkdir -p "$XCF_MONO_ROOT"
-      XCF_DIR="$(cd "$XCF_MONO_ROOT" && pwd)"
-      ok "Using xcf directory: $XCF_DIR"
+# Recover a previously-persisted XCF_MONO_ROOT straight from the shell rc files.
+# Covers the case where a prior run wrote the value but the shell running this
+# script has not sourced it yet, so it is absent from the live environment.
+# Echoes the recovered path (empty if none found).
+recover_persisted_root() {
+  local sh rc path
+  for sh in zsh bash fish; do
+    rc="$(_shell_rc "$sh")" || continue
+    [[ -f "$rc" ]] || continue
+    # Extract the single-quoted value from the last XCF_MONO_ROOT line. Both the
+    # bash/zsh (`export …=`) and fish (`set -gx …`) forms single-quote the path,
+    # so splitting on the quote and taking the 2nd field yields it.
+    path="$(awk -F\' '/XCF_MONO_ROOT/ {v=$2} END{if (v!="") print v}' "$rc" 2>/dev/null)"
+    if [[ -n "$path" ]]; then
+      printf '%s\n' "$path"
       return 0
     fi
-    info "Ignoring XCF_MONO_ROOT for this run."
-  fi
+  done
+}
 
-  if [[ -d "$DEFAULT_XCF_DIR" ]]; then
-    info "An 'xcf' directory already exists at: $DEFAULT_XCF_DIR"
-    local ans
-    read -r -p "Use it? [Y/n] " ans
-    if [[ "${ans:-Y}" =~ ^[Yy]([Ee][Ss])?$ || -z "${ans:-}" ]]; then
-      XCF_DIR="$DEFAULT_XCF_DIR"
-    else
-      local newpath
-      read -r -p "Enter path for a new xcf directory: " newpath
-      [[ -n "$newpath" ]] || die "No path provided."
-      # Expand a leading ~ to $HOME.
-      newpath="${newpath/#\~/$HOME}"
-      mkdir -p "$newpath"
-      XCF_DIR="$newpath"
-    fi
+# Heuristic: does <dir> look like an xcf workspace root? True when it is named
+# 'xcf' or already contains a baseline checkout. Used only to pick a sensible
+# default when nothing has been recorded yet — lets you run the script from
+# inside the workspace you actually mean.
+looks_like_xcf_root() {
+  local dir="$1" r
+  [[ -d "$dir" ]] || return 1
+  [[ "$(basename "$dir")" == "xcf" ]] && return 0
+  for r in ${BASELINE_REPOS[@]+"${BASELINE_REPOS[@]}"}; do
+    [[ -n "$r" && -d "$dir/$r" ]] && return 0
+  done
+  return 1
+}
+
+XCF_DIR=""
+resolve_xcf_dir() {
+  # Precedence for the DEFAULT we offer (highest first):
+  #   1. XCF_MONO_ROOT — live in this shell, else recovered from the shell rc
+  #      files (the "written on a prior run but not sourced yet" case). This
+  #      always wins when present.
+  #   2. The current directory, but only when nothing is recorded AND it looks
+  #      like an xcf workspace — so running from inside the workspace works.
+  #   3. The built-in default, $HOME/xcf.
+  # Whatever we land on is only a DEFAULT: the user is ALWAYS prompted and may
+  # type any other path to override it. The final choice is persisted back to
+  # XCF_MONO_ROOT by persist_mono_root() (called right after this in main).
+  local candidate="" origin=""
+  if [[ -n "${XCF_MONO_ROOT:-}" ]]; then
+    candidate="$XCF_MONO_ROOT"; origin="XCF_MONO_ROOT (environment)"
   else
-    mkdir -p "$DEFAULT_XCF_DIR"
-    XCF_DIR="$DEFAULT_XCF_DIR"
+    candidate="$(recover_persisted_root)"
+    [[ -n "$candidate" ]] && origin="XCF_MONO_ROOT (shell config — not yet sourced)"
   fi
-  # Resolve to an absolute path.
-  XCF_DIR="$(cd "$XCF_DIR" && pwd)"
+  if [[ -z "$candidate" ]] && looks_like_xcf_root "$PWD"; then
+    candidate="$PWD"; origin="current directory"
+  fi
+  if [[ -z "$candidate" ]]; then
+    candidate="$DEFAULT_XCF_DIR"; origin="default"
+  fi
+  # Expand a leading ~ (a recorded value could contain one) before showing it.
+  candidate="${candidate/#\~/$HOME}"
+  info "Suggested xcf workspace: $candidate  [$origin]"
+
+  local ans note=""
+  [[ -d "$candidate" ]] || note=" — will be created"
+  read -r -p "Install the xcf workspace here? ENTER to accept [$candidate]$note, or type a different path: " ans
+
+  local chosen="${ans:-$candidate}"
+  chosen="${chosen/#\~/$HOME}"       # expand a leading ~ in a typed path too
+  [[ -n "$chosen" ]] || die "No path provided."
+  mkdir -p "$chosen"
+  XCF_DIR="$(cd "$chosen" && pwd)"   # resolve to an absolute path
   ok "Using xcf directory: $XCF_DIR"
 }
 
